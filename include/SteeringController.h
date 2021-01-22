@@ -36,7 +36,7 @@ public:
     SteeringController(int countable_events_per_revolution, float update_rate_hz, PidParams params_normal_mode, PidParams params_deadzone_mode);        
     double encoderticks_to_rpm(float tick_count, double samplePeriod);
     double rpm_to_encoderticks(double speed_rpm, double sampleperiod);
-    int update_steering(double target_rpm_wheel_difference, float speed_voltage, float encoder1_val, float encoder2_val, float sample_period);    
+    int update_steering(double target_rpm_wheel_difference, float speed_voltage, float &encoder1_val, double &speed1, float &encoder2_val, double &speed2, float sample_period);    
     void update_pid_params(const PidParams& pid_params);
     void update_pid_params(double Kp, double Ki, double Kd);
     void setDeadzone(int physical_deadzone, int virtual_deadzone);
@@ -50,31 +50,33 @@ public:
 
     PID pid;        
 
+    bool motor1_in_deadzone = true;
+    bool motor2_in_deadzone = true;
+
+    float interpolate_pid_in_deadzone(int motor_nr, float x0, float y0, float x1, float y1, float* encoder_val, float speed);
+    int map_deadzone(int motor_command, int margin, int deadzone);
+    
 private:        
     int countable_events_per_revolution = 0;
     float update_rate_hz;    
     PidParams params_normal_mode;
     PidParams params_deadzone_mode;
 
-    bool motor1_in_deadzone = true;
-    bool motor2_in_deadzone = true;
-
     int virtual_deadzone = 10;
     int physical_deadzone = 80;
 
-    int motor_1_last_good_command = -115;
-    float motor_1_last_good_speed = 8.0;
-    int motor_2_last_good_command = -115;
-    float motor_2_last_good_speed = 8.0;
-    
-    int map_deadzone(int motor_command, int margin, int deadzone);
+    int motor_1_last_good_command = 177;
+    float motor_1_last_good_speed = 13.0;
+    int motor_2_last_good_command = 177;
+    float motor_2_last_good_speed = 13.0;
+        
     bool check_deadzone(int motor_nr, float speed, float steering_offset);    
-    void interpolate_pid_in_deadzone(int motor_nr, float x0, float y0, float x1, float y1, float* encoder_val, float speed);
+    
 };
 
 void SteeringController::setDeadzone(int physical_deadzone, int virtual_deadzone){
-    physical_deadzone = physical_deadzone;
-    virtual_deadzone = virtual_deadzone;
+    this->physical_deadzone = physical_deadzone;
+    this->virtual_deadzone = virtual_deadzone;
 }
 
 SteeringController::SteeringController(int countable_events_per_revolution, float update_rate_hz, PidParams params_normal_mode, PidParams params_deadzone_mode): pid(PID(&pid_input, &pid_output, &pid_setpoint, params_deadzone_mode.Kp, params_deadzone_mode.Ki, params_deadzone_mode.Kd, P_ON_M, DIRECT)), countable_events_per_revolution(countable_events_per_revolution), update_rate_hz(update_rate_hz), params_normal_mode(params_normal_mode), params_deadzone_mode(params_deadzone_mode){
@@ -110,6 +112,10 @@ void SteeringController::set_pid_params_depending_on_deadzone(float speed_voltag
     bool motor2_in_deadzone_before = motor2_in_deadzone;
     motor2_in_deadzone = check_deadzone(2, speed_voltage, steering_offset);
 
+    // // If one of both motors are in the deadzone, let's put both in it.    
+    // motor1_in_deadzone = (motor1_in_deadzone || motor2_in_deadzone);
+    // motor2_in_deadzone = motor1_in_deadzone;
+
     if(motor1_in_deadzone && !motor1_in_deadzone_before)
         update_pid_params(params_deadzone_mode);   
     else if(motor2_in_deadzone && !motor2_in_deadzone_before)
@@ -126,6 +132,10 @@ void SteeringController::update_last_good_speed_measurement(float encoder1_val, 
         if(abs(motor_1_last_good_command) <= abs(motor_command1) && abs(motor_1_last_good_speed) <= abs(encoder1_val)){
             motor_1_last_good_command = motor_command1;
             motor_1_last_good_speed = encoder1_val;
+            // Serial.println("JEEEEEEJ M1:");
+            // Serial.println(motor_1_last_good_command);
+            // Serial.println(motor_1_last_good_speed);
+            // Serial.println("--------------:");
         }
     }
 
@@ -133,12 +143,18 @@ void SteeringController::update_last_good_speed_measurement(float encoder1_val, 
         if(abs(motor_2_last_good_command) <= abs(motor_command2) && abs(motor_2_last_good_speed) <= abs(encoder2_val)){
             motor_2_last_good_command = motor_command2;
             motor_2_last_good_speed = encoder2_val;
+            // Serial.println("JEEEEEEJ M2:");
+            // Serial.println(motor_2_last_good_command);
+            // Serial.println(motor_2_last_good_speed);
+            // Serial.println("--------------:");
         }
     }
 
+    // Serial.println("++++++++++++++");
+
 }
 
-void SteeringController::interpolate_pid_in_deadzone(int motor_nr, float x0, float y0, float x1, float y1, float* encoder_val, float speed){
+float SteeringController::interpolate_pid_in_deadzone(int motor_nr, float x0, float y0, float x1, float y1, float* encoder_val, float speed){
     float tot_speed = motor_nr==1?speed-pid_output:speed+pid_output;
     float prev_motor_command = constrain(tot_speed, -2047.0, 2047.0);        
     float abs_motor_command = abs(prev_motor_command);
@@ -151,6 +167,7 @@ void SteeringController::interpolate_pid_in_deadzone(int motor_nr, float x0, flo
 
     if(x1 != x0)        
         *encoder_val = (y0*(x1 - prev_motor_command) + y1*(prev_motor_command-x0))/(x1-x0);  
+    return prev_motor_command;
 }
 
 void SteeringController::calc_motor_commands(float speed_voltage, int steering_offset, int* motor_command1, int* motor_command2){
@@ -166,18 +183,39 @@ void SteeringController::calc_motor_commands(float speed_voltage, int steering_o
     *motor_command2 = map_deadzone(*motor_command2, virtual_deadzone, physical_deadzone);
 }
 
-int SteeringController::update_steering(double target_rpm_wheel_difference, float speed_voltage, float encoder1_val, float encoder2_val, float sample_period){    
+int SteeringController::update_steering(double target_rpm_wheel_difference, float speed_voltage, float &encoder1_val, double &speed1, float &encoder2_val, double &speed2, float sample_period){    
         
-    if(motor1_in_deadzone)
-        interpolate_pid_in_deadzone(1, motor_1_last_good_command, motor_1_last_good_speed, 0.0, 0.0, &encoder1_val, speed_voltage);
-    if(motor2_in_deadzone)
-        interpolate_pid_in_deadzone(2, motor_2_last_good_command, motor_2_last_good_speed, 0.0, 0.0, &encoder2_val, speed_voltage);
+    if(motor1_in_deadzone){
+        // Serial.print("INTERPOLATE M1: ");        
+        float prev_motor_cmd = interpolate_pid_in_deadzone(1, motor_1_last_good_command, motor_1_last_good_speed, 0.0, 0.0, &encoder1_val, speed_voltage);
+        // Serial.print(prev_motor_cmd);
+        // Serial.print(" / ");
+        // Serial.println(encoder1_val);
+        speed1 = encoderticks_to_rpm(encoder1_val, sample_period);
+      
+        
+    }
+    if(motor2_in_deadzone){
+        // Serial.print("INTERPOLATE M2: ");        
+        float prev_motor_cmd = interpolate_pid_in_deadzone(2, motor_2_last_good_command, motor_2_last_good_speed, 0.0, 0.0, &encoder2_val, speed_voltage);      
+        // Serial.print(prev_motor_cmd);
+        // Serial.print(" / ");
+        // Serial.println(encoder2_val);
+        speed2 = encoderticks_to_rpm(encoder2_val, sample_period);
+    }    
 
-    double speed1 = encoderticks_to_rpm(encoder1_val, sample_period);
-    double speed2 = encoderticks_to_rpm(encoder2_val, sample_period);     
-
+    // if(motor1_in_deadzone && motor2_in_deadzone){        
+    //     Serial.print("DEADZONE ");
+    // }
+    // Serial.print("ERROR: ");
+    // Serial.print(speed2);
+    // Serial.print("-");
+    // Serial.print(speed1);
+    // Serial.print("=");
+    // Serial.println(speed2 - speed1);
+    
     pid_setpoint = target_rpm_wheel_difference;
-    pid_input = speed1 - speed2;
+    pid_input = speed2 - speed1;
     pid.Compute();      
     int steering_offset = round(pid_output);    
     
